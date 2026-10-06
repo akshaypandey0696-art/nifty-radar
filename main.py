@@ -1,9 +1,9 @@
 from flask import Flask, jsonify, render_template_string
-import yfinance as yf
-import pandas as pd
-import requests
+import urllib.request
+import json
 import threading
 import time
+import os
 from datetime import datetime
 
 app = Flask(__name__)
@@ -35,102 +35,128 @@ NIFTY_NEXT_50 = [
     "CGPOWER.NS", "BSE.NS", "POLICYBZR.NS", "TRENT.NS", "ZOMATO.NS"
 ]
 
-cached_data = {"nifty50": [], "next50": [], "updated": "Syncing..."}
+market_store = {"nifty50": [], "next50": [], "updated": "Syncing..."}
 alerted = set()
 
 def send_telegram(msg):
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=8)
+        payload = json.dumps({"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}).encode('utf-8')
+        req = urllib.request.Request(url, data=payload, headers={'Content-Type': 'application/json'})
+        urllib.request.urlopen(req, timeout=10)
     except:
         pass
 
-def calculate_wilders_rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1.0/period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1.0/period, adjust=False).mean()
-    rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
+def calculate_rsi_series(prices, period=14):
+    if len(prices) <= period:
+        return [50.0] * len(prices)
+    gains, losses = [], []
+    for i in range(1, len(prices)):
+        d = prices[i] - prices[i - 1]
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
 
-def backtest_stock(df):
-    signals = []
+    avg_g = sum(gains[:period]) / period
+    avg_l = sum(losses[:period]) / period
+    rsis = [None] * period
+    rs = 100 if avg_l == 0 else avg_g / avg_l
+    rsis.append(round(100 - (100 / (1 + rs)), 1))
+
+    for i in range(period, len(gains)):
+        avg_g = (avg_g * 13 + gains[i]) / 14
+        avg_l = (avg_l * 13 + losses[i]) / 14
+        rs = 100 if avg_l == 0 else avg_g / avg_l
+        rsis.append(round(100 - (100 / (1 + rs)), 1))
+    return rsis
+
+def backtest(prices, rsis, dates):
+    trades = []
     in_t = False
     ep, ed, eidx = 0, "", 0
-    for i in range(15, len(df)):
-        rsi = df['RSI'].iloc[i]
-        price = df['Close'].iloc[i]
-        d_str = df.index[i].strftime("%d %b %Y")
-        if not in_t and rsi < 35:
+    for i in range(15, len(prices)):
+        r = rsis[i]
+        p = prices[i]
+        d = dates[i]
+        if not in_t and r and r < 35:
             in_t = True
-            ep, ed, eidx = price, d_str, i
+            ep, ed, eidx = p, d, i
         elif in_t:
-            gain = ((price - ep) / ep) * 100
-            if rsi >= 65 or gain >= 5 or (i - eidx) >= 20:
-                signals.append({
+            gain = ((p - ep) / ep) * 100
+            if (r and r >= 65) or gain >= 5 or (i - eidx) >= 20:
+                trades.append({
                     "entryDate": ed, "entryPrice": round(ep, 2),
-                    "exitDate": d_str, "exitPrice": round(price, 2),
+                    "exitDate": d, "exitPrice": round(p, 2),
                     "pnl": round(gain, 2), "isWin": gain > 0,
                     "days": i - eidx
                 })
                 in_t = False
-    tot = len(signals)
-    wins = len([s for s in signals if s['isWin']])
+    tot = len(trades)
+    wins = len([t for t in trades if t['isWin']])
     rate = round((wins / tot) * 100, 1) if tot > 0 else 0
-    last = signals[-1] if tot > 0 else None
-    return tot, wins, rate, last, list(reversed(signals[-5:]))
+    last = trades[-1] if tot > 0 else None
+    return tot, wins, rate, last
 
-def fetch_group(tickers, b_name):
-    items = []
+def fetch_single(symbol, b_name):
     try:
-        data = yf.download(tickers, period="1y", interval="1d", progress=False, group_by='ticker')
-        for sym in tickers:
-            try:
-                df = data[sym].dropna(how="all").copy() if len(tickers) > 1 else data.dropna(how="all").copy()
-                if len(df) < 25:
-                    continue
-                df['RSI'] = calculate_wilders_rsi(df['Close'], 14)
-                p = round(float(df['Close'].iloc[-1]), 2)
-                r = round(float(df['RSI'].iloc[-1]), 1)
-                tot, wins, rate, last, hist = backtest_stock(df)
-                s_name = sym.replace(".NS", "")
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=1y&interval=1d"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as res:
+            d = json.loads(res.read().decode('utf-8'))['chart']['result'][0]
+            ts = d['timestamp']
+            quotes = d['indicators']['quote'][0]['close']
+            
+            clean_p, clean_d = [], []
+            for t, p in zip(ts, quotes):
+                if p is not None:
+                    clean_p.append(p)
+                    clean_d.append(datetime.fromtimestamp(t).strftime('%d %b %Y'))
+            
+            if len(clean_p) < 25:
+                return None
+            
+            rsis = calculate_rsi_series(clean_p)
+            ltp = round(clean_p[-1], 2)
+            curr_rsi = rsis[-1]
+            tot, wins, wr, last = backtest(clean_p, rsis, clean_d)
+            sym_clean = symbol.replace(".NS", "")
 
-                if r < 35 and s_name not in alerted:
-                    msg = f"🟢 *BUY SIGNAL TRIGGERED (< 35)* 🟢\n\n" \
-                          f"📌 *Stock:* {s_name} ({b_name})\n" \
-                          f"💰 *LTP:* ₹{p}\n" \
-                          f"📉 *RSI:* {r}\n" \
-                          f"🎯 *Win Rate:* {rate}% ({wins}/{tot} Wins)\n"
-                    if last:
-                        msg += f"\n📜 *Last Trade:* {'✅ TARGET HIT' if last['isWin'] else '❌ STOPPED'}\n" \
-                               f"• Return: {last['pnl']}%\n• Duration: {last['days']} Days"
-                    send_telegram(msg)
-                    alerted.add(s_name)
-                elif r >= 35 and s_name in alerted:
-                    alerted.discard(s_name)
+            # Duplicate Check: Sirf fresh signal trigger par alert
+            if curr_rsi and curr_rsi < 35 and sym_clean not in alerted:
+                msg = f"🟢 *BUY SIGNAL TRIGGERED (< 35)* 🟢\n\n" \
+                      f"📌 *Stock:* {sym_clean} ({b_name})\n" \
+                      f"💰 *LTP:* ₹{ltp}\n" \
+                      f"📉 *RSI:* {curr_rsi}\n" \
+                      f"🎯 *Win Rate:* {wr}% ({wins}/{tot} Wins)\n"
+                if last:
+                    msg += f"\n📜 *Last Trade:* {'✅ TARGET HIT' if last['isWin'] else '❌ STOPPED'}\n" \
+                           f"• Return: {last['pnl']}%\n• Duration: {last['days']} Days"
+                send_telegram(msg)
+                alerted.add(sym_clean)
+            elif curr_rsi and curr_rsi >= 35 and sym_clean in alerted:
+                alerted.discard(sym_clean)
 
-                items.append({
-                    "sym": s_name, "ltp": p, "rsi": r,
-                    "winRate": rate, "wins": wins, "total": tot,
-                    "last": last, "hist": hist
-                })
-            except:
-                continue
+            return {
+                "sym": sym_clean, "ltp": ltp, "rsi": curr_rsi,
+                "winRate": wr, "wins": wins, "total": tot,
+                "last": last
+            }
     except:
-        pass
-    return items
+        return None
 
-def scan_loop():
+def background_loop():
     while True:
-        n50 = fetch_group(NIFTY_50, "NIFTY 50")
-        nxt50 = fetch_group(NIFTY_NEXT_50, "NIFTY NEXT 50")
-        cached_data["nifty50"] = n50
-        cached_data["next50"] = nxt50
-        cached_data["updated"] = datetime.now().strftime("%I:%M %p")
-        time.sleep(240)
+        for b_name, b_list, b_key in [("NIFTY 50", NIFTY_50, "nifty50"), ("NIFTY NEXT 50", NIFTY_NEXT_50, "next50")]:
+            temp = []
+            for s in b_list:
+                item = fetch_single(s, b_name)
+                if item:
+                    temp.append(item)
+                time.sleep(0.3)
+            market_store[b_key] = temp
+        market_store["updated"] = datetime.now().strftime("%I:%M %p")
+        time.sleep(180)
 
-threading.Thread(target=scan_loop, daemon=True).start()
+threading.Thread(target=background_loop, daemon=True).start()
 
 HTML_PAGE = """<!DOCTYPE html>
 <html>
@@ -171,7 +197,7 @@ HTML_PAGE = """<!DOCTYPE html>
   </div>
   <div class="filter-row">
     <input type="text" id="srch" class="search-box" placeholder="Search stock..." oninput="render()">
-    <button class="buy-btn" id="bf" onclick="toggleB()">Only BUY (<35)</button>
+    <button class="buy-btn" id="bf" onclick="toggleB()">Only BUY (&lt;35)</button>
   </div>
 </div>
 <div class="list" id="box"><div style="text-align:center;padding:40px;color:#8b949e">Connecting Cloud Scanner...</div></div>
@@ -224,7 +250,7 @@ function render(){
     `;
   }).join('');
 }
-setInterval(sync, 5000);
+setInterval(sync, 4000);
 sync();
 </script>
 </body>
@@ -236,7 +262,8 @@ def home():
 
 @app.route('/api')
 def api():
-    return jsonify(cached_data)
+    return jsonify(market_store)
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
